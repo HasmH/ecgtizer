@@ -46,9 +46,29 @@ WAVEFORM_VARIANCE_MIN = 200  # Min vertical variance to detect signal presence
 # --- Pixel values ---
 WHITE_PIXEL = 255
 
+# --- Dark-grid removal ---
+# ECGtizer's colour filter only strips bright (orange/pink) grids.  A grid
+# printed in ink as dark as the trace survives thresholding and swamps the
+# binary (clean traces are ~2-4% lit; a surviving dark grid pushes this to
+# ~13-27%).  Above this lit-fraction the grid is stripped morphologically.
+DARK_GRID_LIT_THRESHOLD = 0.08
+
 # --- PDF rasterization safety caps (decompression-bomb defense) ---
 MAX_PDF_PAGES = 5  # ECG printouts are single-page; allow margin
 MAX_DPI = 1200  # 2.4x typical 500 DPI; refuse pathological values
+
+# --- Track detection (landscape layouts) ---
+# Tracks are located as peaks in the row-variance profile.  The minimum
+# spacing between two peaks is image_height / DIVISOR.  The default divisor
+# suits the sparse 3x4 / 6x2 sheets (4-6 rows).  Dense 12x1 sheets stack 12-13
+# rows ~height/13 apart — closer than the default floor allows — so those rows
+# get suppressed.  When the first pass already yields many peaks (implying rows
+# were clipped), we re-detect with the tighter DENSE divisor so all 12-13 rows
+# resolve.  Keeping the default for sparse layouts leaves their detection
+# byte-identical, confining the change to genuinely dense stacks.
+TRACK_DISTANCE_DIVISOR = 10  # Min inter-track spacing = image_height / this
+DENSE_TRACK_DISTANCE_DIVISOR = 16  # Tighter spacing used for dense (12x1) sheets
+DENSE_LAYOUT_MIN_TRACKS = 8  # Min tracks in the tight pass to treat a sheet as dense
 
 # --- Lead timing boundaries (samples) ---
 LEAD_TIME_3X4 = {
@@ -80,6 +100,114 @@ LEAD_TIME_6X2 = {
     "V5": (2500, 5000),
     "V6": (2500, 5000),
 }
+# 12x1 layout: every lead is printed on its own track for the full 10 s, so
+# each occupies the entire (0, 5000) window.  "IIc" is the optional 13th
+# rhythm strip.
+LEAD_TIME_12X1 = {
+    "I": (0, 5000),
+    "II": (0, 5000),
+    "III": (0, 5000),
+    "AVR": (0, 5000),
+    "AVL": (0, 5000),
+    "AVF": (0, 5000),
+    "V1": (0, 5000),
+    "V2": (0, 5000),
+    "V3": (0, 5000),
+    "V4": (0, 5000),
+    "V5": (0, 5000),
+    "V6": (0, 5000),
+    "IIc": (0, 5000),
+}
+
+# --- 12x1 row ordering (top -> bottom) ---
+# Real 12x1 printouts do not agree on row order, so it is configurable.
+# "standard" is the conventional order; "interleaved" is the layout emitted by
+# this repo's Create_database/ecg_image_generator (its config.yaml `leadNames_12`
+# reversed for plotting).  A caller may also pass an explicit 12-name list.
+LEAD_ORDER_12X1_STANDARD = ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+LEAD_ORDER_12X1_INTERLEAVED = ["V4", "V1", "AVR", "I", "V5", "V2", "AVL", "II", "V6", "V3", "AVF", "III"]
+LEAD_ORDERS_12X1 = {
+    "standard": LEAD_ORDER_12X1_STANDARD,
+    "interleaved": LEAD_ORDER_12X1_INTERLEAVED,
+}
+
+
+def _resolve_lead_order_12x1(lead_order: str | list | None) -> list[str]:
+    """Return a validated 12-name top-to-bottom lead order for a 12x1 sheet.
+
+    ``lead_order`` may be ``None`` (default "standard"), a named preset key
+    ("standard" / "interleaved"), or an explicit list of 12 lead names.  Names
+    are upper-cased so ``"aVR"`` and ``"AVR"`` are treated alike.  Falls back to
+    the standard order on any invalid input.
+    """
+    if lead_order is None:
+        return list(LEAD_ORDER_12X1_STANDARD)
+    if isinstance(lead_order, str):
+        order = LEAD_ORDERS_12X1.get(lead_order.lower())
+        if order is None:
+            logger.warning("Unknown 12x1 lead_order %r; using standard.", lead_order)
+            return list(LEAD_ORDER_12X1_STANDARD)
+        return list(order)
+    # Explicit list of names
+    names = [str(n).upper() for n in lead_order]
+    if set(names) != set(LEAD_ORDER_12X1_STANDARD) or len(names) != 12:
+        logger.warning("Invalid 12x1 lead_order %r; using standard.", lead_order)
+        return list(LEAD_ORDER_12X1_STANDARD)
+    return names
+
+
+def _crop_to_content(image: np.ndarray, margin_frac: float = 0.01, min_whitespace_frac: float = 0.12) -> np.ndarray:
+    """Trim blank paper margins so the ECG fills the frame.
+
+    A4 printouts often place the trace in only part of the page, leaving wide
+    blank borders.  That skews the aspect ratio — a landscape 12-lead recording
+    on a portrait A4 page reads as "portrait" — and misroutes both format
+    detection and track segmentation.  Detect the ink bounding box (dark pixels
+    on light paper) and crop to it with a small margin, but only when there is
+    substantial whitespace to remove.  Full-frame images and dark-background
+    formats (e.g. Kardia, whose pixels are mostly dark) are returned unchanged.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    ink = gray < 128
+    # Skip dark-background images — cropping "ink" there is meaningless.
+    if ink.mean() > 0.5:
+        return image
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return image
+    r0, r1, c0, c1 = int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
+    content_frac = ((r1 - r0) * (c1 - c0)) / float(h * w)
+    # Already fills most of the frame — leave untouched.
+    if content_frac > (1.0 - min_whitespace_frac):
+        return image
+    my, mx = int(margin_frac * h), int(margin_frac * w)
+    r0, r1 = max(0, r0 - my), min(h, r1 + my + 1)
+    c0, c1 = max(0, c0 - mx), min(w, c1 + mx + 1)
+    return image[r0:r1, c0:c1]
+
+
+def _remove_dark_grid(image_bin: np.ndarray) -> np.ndarray:
+    """Strip a dark/near-black grid that survived thresholding.
+
+    Bright (orange/pink) grids are removed by the colour filter in
+    ``_binarize_image``, but a grid printed in ink as dark as the trace is not —
+    it fills the binary image and the extractor then follows the grid instead of
+    the waveform.  The grid is a set of long, straight, full-span horizontal and
+    vertical lines, whereas the ECG trace is a short-run curve; isolate those
+    lines with long line-shaped morphological openings and subtract them.  The
+    caller applies this only when the binary is abnormally dense, so clean
+    bright-grid images are left untouched.
+    """
+    h, w = image_bin.shape
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * 0.5), 20), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * 0.5), 20)))
+    grid = cv2.bitwise_or(
+        cv2.morphologyEx(image_bin, cv2.MORPH_OPEN, h_kernel),
+        cv2.morphologyEx(image_bin, cv2.MORPH_OPEN, v_kernel),
+    )
+    return cv2.subtract(image_bin, grid)
 
 
 def _binarize_image(image: np.ndarray, TYPE: str, NOISE: bool | float) -> np.ndarray:
@@ -110,6 +238,13 @@ def _binarize_image(image: np.ndarray, TYPE: str, NOISE: bool | float) -> np.nda
         if image.ndim == 3:
             max_channel = np.max(image, axis=2)
             image_bin[max_channel > 128] = 0
+
+    # A dark/near-black grid escapes the colour filter above and swamps the
+    # binary; when the result is abnormally dense, strip the grid's long
+    # straight lines.  Clean images stay well below the threshold and are left
+    # untouched.
+    if image_bin.mean() > DARK_GRID_LIT_THRESHOLD * WHITE_PIXEL:
+        image_bin = _remove_dark_grid(image_bin)
     return image_bin
 
 
@@ -542,7 +677,21 @@ def tracks_extraction(
     if len(image) < len(image[0]):
         # Compute the pikes position
         # peaks = signal.argrelextrema(horizontal_variance, np.greater, order = int(0.05*len(image)))[0]
-        peaksh, _ = find_peaks(horizontal_variance, height=len(image[0]), distance=int(len(image) / 10))
+        peaksh, _ = find_peaks(
+            horizontal_variance, height=len(image[0]), distance=int(len(image) / TRACK_DISTANCE_DIVISOR)
+        )
+        # Dense 12x1 stacks have rows closer than the default spacing floor, so
+        # this first pass suppresses roughly every other row (12 rows -> ~6
+        # peaks, which would masquerade as 6x2).  Re-run with a tighter floor
+        # and adopt it only when it reveals a substantially denser structure —
+        # i.e. many more peaks than the default pass.  Sparse 3x4 / 6x2 sheets
+        # have rows far wider apart than the tighter floor, so the two passes
+        # agree and ``peaksh`` keeps the default (unchanged) result.
+        peaksh_dense, _ = find_peaks(
+            horizontal_variance, height=len(image[0]), distance=int(len(image) / DENSE_TRACK_DISTANCE_DIVISOR)
+        )
+        if len(peaksh_dense) >= DENSE_LAYOUT_MIN_TRACKS and len(peaksh_dense) > len(peaksh) + 2:
+            peaksh = peaksh_dense
         # if NOISE:
         #     peaksh, _ = find_peaks(horizontal_variance, height=(len(image)-(len(image[0])*15/100),len(image[0])), distance=int(len(image)/10))
 
@@ -843,6 +992,7 @@ def lead_cutting(
     NOISE: bool | float,
     DEBUG: bool,
     dic_image_bin: dict[int, np.ndarray] | None = None,
+    lead_order: str | list | None = None,
 ) -> dict[str, np.ndarray] | np.ndarray:
     """
     Cut each tracks into leads
@@ -855,6 +1005,10 @@ def lead_cutting(
     NOISE : bool, if the image is noised or not
     DEBUG : bool, show the image
     dic_image_bin : dict, optional binary track images for calibration
+    lead_order : str, list or None, optional
+        Row order (top -> bottom) for the 12x1 layout: a preset key
+        ("standard" / "interleaved"), an explicit 12-name list, or ``None``
+        for the standard order. Ignored for other layouts.
 
     Returns
     -------
@@ -901,6 +1055,17 @@ def lead_cutting(
                 5: ["AVF", "V6"],
             }
             dic_time = LEAD_TIME_6X2
+        # The disposition of the ECG is 12x1
+        elif len(dic_tracks) in (12, 13):
+            # Each track holds a single lead for the full 10 s, so there is
+            # one lead per track (no horizontal splitting).  Row order varies
+            # by device, so it is taken from ``lead_order``.  A 13th track,
+            # when present, is the lead-II rhythm strip ("IIc").
+            LEAD_NUMBER = 1
+            _order = _resolve_lead_order_12x1(lead_order)
+            dic_association = {i: [_order[i]] for i in range(12)}
+            dic_association[12] = ["IIc"]
+            dic_time = LEAD_TIME_12X1
 
         ########## METTRE UN ELSE ICI ##################
         # else:
@@ -926,7 +1091,7 @@ def lead_cutting(
         if TYPE.lower() != "kardia":
             for t in dic_tracks:
                 _lp = REF_PULSE_CLASSIC
-                if len(dic_tracks) in (4, 6):
+                if len(dic_tracks) in (4, 6, 12, 13):
                     _lp = len(dic_tracks[t]) - SIGNAL_LENGTH_STANDARD
 
                 # Prefer binary-image calibration (measures actual square height)

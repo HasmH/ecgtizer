@@ -188,6 +188,94 @@ class TestAnalysisPipeline:
         assert avg_corr > 0.5
 
 
+def _make_landscape_ecg_image(n_rows, row_h=80, gap=40, width=3000):
+    """Synthetic landscape ECG: ``n_rows`` waveform tracks on white paper.
+
+    Each track has a small calibration square at the left margin followed by a
+    full-width sinusoidal waveform. Used to exercise track detection and the
+    12x1 pipeline without a real scan.
+    """
+    amp = row_h // 3
+    height = gap + n_rows * (row_h + gap)
+    img = np.ones((height, width, 3), dtype=np.uint8) * 255
+
+    def paint(x, y):
+        y = max(0, min(height - 1, y))
+        img[max(0, y - 1):y + 2, x] = 0
+
+    for i in range(n_rows):
+        yc = gap + i * (row_h + gap) + row_h // 2
+        # Calibration square: up-step (baseline -> baseline-amp -> baseline).
+        for x in range(30, 130):
+            paint(x, yc if (x < 50 or x > 110) else yc - amp)
+        for y in range(yc - amp, yc + 1):  # vertical edges of the square
+            paint(50, y)
+            paint(110, y)
+        # Waveform body: a baseline-dominant trace (flat with periodic
+        # QRS-like spikes), so each track yields a single variance peak at its
+        # baseline — as real ECGs do — rather than the two turning-point peaks
+        # a pure sinusoid would produce.
+        period = 100 + i * 6  # vary rate per lead so signals differ
+        for x in range(160, width):
+            phase = (x - 160) % period
+            if phase < 20:
+                y = yc - int(amp * (1 - abs(phase - 10) / 10.0))  # triangular spike up
+            else:
+                y = yc  # baseline
+            paint(x, y)
+    return img
+
+
+class TestTwelveByOneFormat:
+    """12x1 layout: 12 (or 13) tracks, each carrying one full 10 s lead."""
+
+    TWELVE_LEADS = {"I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"}
+
+    @pytest.mark.parametrize("n_rows", [4, 6, 12])
+    def test_track_detection_count(self, n_rows):
+        """Adaptive detection resolves sparse (4, 6) and dense (12) stacks.
+
+        Guards against the 12x1 spacing change over-segmenting 3x4/6x2 sheets.
+        """
+        from ecgtizer.PDF2XML import tracks_extraction
+        img = _make_landscape_ecg_image(n_rows)
+        dic_tracks, _, _ = tracks_extraction(img, "classic", 300, "", NOISE=False, DEBUG=False)
+        assert len(dic_tracks) == n_rows
+
+    def test_12x1_pipeline_yields_full_leads(self):
+        """End-to-end (detect -> extract -> cut) on a synthetic 12-row sheet."""
+        from ecgtizer.PDF2XML import tracks_extraction, lead_extraction, lead_cutting
+        img = _make_landscape_ecg_image(12)
+        dic_tracks, _, _ = tracks_extraction(img, "classic", 300, "", NOISE=False, DEBUG=False)
+        assert len(dic_tracks) == 12
+        dic_ex, image_bin, _ = lead_extraction(dic_tracks, "full", "classic", NOISE=False)
+        leads = lead_cutting(dic_ex, 300, "classic", "", 0, NOISE=False, DEBUG=False, dic_image_bin=image_bin)
+        assert set(leads.keys()) == self.TWELVE_LEADS
+        for name, sig in leads.items():
+            assert len(sig) == 5000, f"{name} has length {len(sig)}"
+            assert np.all(np.isfinite(sig)), f"{name} has non-finite values"
+            assert np.any(sig != 0), f"{name} is all zeros"
+
+    def test_ecgtizer_class_end_to_end(self, tmp_output_dir):
+        """Full ECGtizer entry point: crop + noise override + interleaved order."""
+        import os
+        import cv2
+        from ecgtizer import ECGtizer
+
+        img = _make_landscape_ecg_image(12)
+        path = os.path.join(tmp_output_dir, "synthetic_12x1.png")
+        cv2.imwrite(path, img)
+        # typ/noise force the deterministic path (synthetic B/W lacks the colour
+        # cues auto-detection relies on); lead_order picks the interleaved layout.
+        ecg = ECGtizer(
+            file=path, dpi=300, extraction_method="full", typ="classic", noise=False, lead_order="interleaved"
+        )
+        leads = ecg.extracted_lead
+        assert isinstance(leads, dict)
+        assert set(leads.keys()) == self.TWELVE_LEADS
+        assert all(len(v) == 5000 for v in leads.values())
+
+
 class TestMultiFormatSupport:
     """Test that different ECG formats are handled correctly."""
 

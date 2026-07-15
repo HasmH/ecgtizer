@@ -40,6 +40,13 @@ docs/_build/
 # Vignette / notebook outputs
 output/
 
+# 12x1 demo generation intermediates
+examples/12x1/samples/_wfdb/
+examples/12x1/samples/_render/
+
+# Digitized clinical outputs from run.py (may contain patient data)
+data/digitized/
+
 # Test / coverage artefacts
 .coverage
 .coverage.*

@@ -81,6 +81,12 @@ format. A deep-learning completion module can extend partial leads (2.5 s or
 |--------|--------|-------|--------|
 | Classic 3x4 | 4 rows, 3 columns | I, II, III, aVR, aVL, aVF, V1-V6 | Standard 12-lead printout |
 | Classic 6x2 | 2 rows, 6 columns | Same 12 leads | Alternative 12-lead layout |
+| Classic 12x1 | 12 rows, 1 column | Same 12 leads | Full-disclosure layout: each lead spans the full 10 s |
+
+> **12x1 row order.** Real 12x1 printouts differ in how rows are ordered. Pass
+> `lead_order` to select it: `"standard"` (default), `"interleaved"` (the order
+> produced by this repo's `ecg_image_generator`), or an explicit list of 12 lead
+> names top-to-bottom. On the CLI use `--lead-order interleaved`.
 | Wellue | Single strip | I (or selected lead) | Wellue portable devices |
 | Kardia single | Single strip | I | AliveCor Kardia single-lead |
 | Kardia multi | Multiple pages | I, II, III, aVR, aVL, aVF | AliveCor Kardia 6-lead |

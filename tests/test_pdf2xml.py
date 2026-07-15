@@ -148,6 +148,188 @@ class TestLeadExtraction:
         assert len(result) == 2
 
 
+def _make_classic_track(n_samples=5140, freq=1.0, amp=40.0, pulse_len=140):
+    """Build one synthetic *extracted* track (post lead_extraction).
+
+    Values are in pixel-row coordinates (larger value = lower on the page).
+    The track starts with a calibration square (a ~1 mV upward step) followed
+    by a sinusoidal body, mirroring the [pulse | signal] layout the calibration
+    logic in ``lead_cutting`` expects.
+    """
+    track = np.full(n_samples, 250.0)
+    plateau_end = pulse_len - 10
+    track[10:plateau_end] = 150.0  # calibration square: 100 px ~= 1 mV up
+    body = np.arange(n_samples - pulse_len)
+    track[pulse_len:] = 250.0 - amp * np.sin(2 * np.pi * freq * body / 500.0)
+    return track
+
+
+class TestLeadCutting:
+    """lead_cutting format inference by track count (3x4 / 6x2 / 12x1)."""
+
+    TWELVE_LEADS = {"I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"}
+
+    def test_12x1_twelve_tracks(self):
+        """12 tracks -> 12 full-length leads, one per track."""
+        from ecgtizer.PDF2XML import lead_cutting
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(12)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False)
+        assert set(leads.keys()) == self.TWELVE_LEADS
+        for name, sig in leads.items():
+            assert len(sig) == 5000, f"{name} has length {len(sig)}"
+            assert np.all(np.isfinite(sig))
+
+    def test_12x1_thirteen_tracks_has_rhythm(self):
+        """A 13th track is the lead-II rhythm strip (IIc)."""
+        from ecgtizer.PDF2XML import lead_cutting
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(13)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False)
+        assert set(leads.keys()) == self.TWELVE_LEADS | {"IIc"}
+        assert len(leads["IIc"]) == 5000
+
+    def test_12x1_leads_span_full_window(self):
+        """Unlike 3x4/6x2, a 12x1 lead carries signal across the whole 10 s."""
+        from ecgtizer.PDF2XML import lead_cutting
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(12)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False)
+        # The last quarter (7.5-10 s) must be populated for every lead.
+        for name, sig in leads.items():
+            assert np.any(sig[3750:] != 0), f"{name} is empty in its final quarter"
+
+    def test_3x4_regression(self):
+        """4 tracks still infer 3x4: a rhythm strip and time-windowed leads."""
+        from ecgtizer.PDF2XML import lead_cutting
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(4)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False)
+        assert "IIc" in leads
+        assert self.TWELVE_LEADS.issubset(leads.keys())
+        # Lead I only occupies the first 2.5 s (0-1250) in 3x4.
+        assert np.all(leads["I"][1250:] == 0)
+
+    def test_6x2_regression(self):
+        """6 tracks still infer 6x2: 5 s left column, 5 s right column."""
+        from ecgtizer.PDF2XML import lead_cutting
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(6)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False)
+        assert set(leads.keys()) == self.TWELVE_LEADS
+        # Lead I occupies the first 5 s; V1 the last 5 s.
+        assert np.all(leads["I"][2500:] == 0)
+        assert np.all(leads["V1"][:2500] == 0)
+
+    def test_12x1_interleaved_order(self):
+        """The 'interleaved' preset assigns names by the generator's row order."""
+        from ecgtizer.PDF2XML import lead_cutting, LEAD_ORDER_12X1_INTERLEAVED
+        # Distinct amplitude per track so we can trace which track became which lead.
+        tracks = {i: _make_classic_track(amp=10 + i) for i in range(12)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False, lead_order="interleaved")
+        assert set(leads.keys()) == self.TWELVE_LEADS
+        # Track 0 -> V4, track 2 -> AVR, track 3 -> I (per the interleaved order).
+        assert LEAD_ORDER_12X1_INTERLEAVED[0] == "V4"
+        assert LEAD_ORDER_12X1_INTERLEAVED[2] == "AVR"
+
+    def test_12x1_explicit_list_order(self):
+        """An explicit 12-name list is honoured verbatim (top to bottom)."""
+        from ecgtizer.PDF2XML import lead_cutting
+        custom = ["V6", "V5", "V4", "V3", "V2", "V1", "AVF", "AVL", "AVR", "III", "II", "I"]
+        tracks = {i: _make_classic_track(freq=1 + 0.1 * i) for i in range(12)}
+        leads = lead_cutting(tracks, 300, "classic", "", 0, NOISE=False, DEBUG=False, lead_order=custom)
+        assert set(leads.keys()) == self.TWELVE_LEADS
+
+
+class TestResolveLeadOrder:
+    """_resolve_lead_order_12x1: preset keys, explicit lists, invalid input."""
+
+    def test_none_is_standard(self):
+        from ecgtizer.PDF2XML import _resolve_lead_order_12x1, LEAD_ORDER_12X1_STANDARD
+        assert _resolve_lead_order_12x1(None) == LEAD_ORDER_12X1_STANDARD
+
+    def test_interleaved_preset(self):
+        from ecgtizer.PDF2XML import _resolve_lead_order_12x1, LEAD_ORDER_12X1_INTERLEAVED
+        assert _resolve_lead_order_12x1("interleaved") == LEAD_ORDER_12X1_INTERLEAVED
+
+    def test_lowercase_names_normalized(self):
+        from ecgtizer.PDF2XML import _resolve_lead_order_12x1
+        order = ["aVR", "aVL", "aVF", "i", "ii", "iii", "v1", "v2", "v3", "v4", "v5", "v6"]
+        expected = ["AVR", "AVL", "AVF", "I", "II", "III", "V1", "V2", "V3", "V4", "V5", "V6"]
+        assert _resolve_lead_order_12x1(order) == expected
+
+    def test_invalid_falls_back_to_standard(self):
+        from ecgtizer.PDF2XML import _resolve_lead_order_12x1, LEAD_ORDER_12X1_STANDARD
+        assert _resolve_lead_order_12x1(["I", "II"]) == LEAD_ORDER_12X1_STANDARD  # wrong length
+        assert _resolve_lead_order_12x1("bogus") == LEAD_ORDER_12X1_STANDARD  # unknown key
+
+
+class TestCropToContent:
+    """_crop_to_content: trims blank margins, leaves full/dark images alone."""
+
+    def test_crops_portrait_padded_page(self):
+        from ecgtizer.PDF2XML import _crop_to_content
+        # Landscape ink band on a tall white page (like a 12x1 on portrait A4).
+        img = np.full((1200, 800, 3), 255, dtype=np.uint8)
+        img[100:400, 50:750] = 0  # ink occupies a wide-but-short region up top
+        out = _crop_to_content(img)
+        assert out.shape[0] < img.shape[0]  # bottom whitespace removed
+        assert out.shape[1] <= img.shape[1]
+
+    def test_full_frame_unchanged(self):
+        from ecgtizer.PDF2XML import _crop_to_content
+        # Light page whose ink already spans nearly the whole frame.
+        img = np.full((500, 900, 3), 255, dtype=np.uint8)
+        img[10:490, 10:890] = 0
+        out = _crop_to_content(img)
+        assert out.shape == img.shape
+
+    def test_dark_background_unchanged(self):
+        from ecgtizer.PDF2XML import _crop_to_content
+        img = np.zeros((600, 800, 3), dtype=np.uint8)  # mostly dark (Kardia-like)
+        img[300, :] = 255
+        out = _crop_to_content(img)
+        assert out.shape == img.shape
+
+
+def _make_grid_and_trace():
+    """Binary image (0/255) with a dense full-span grid plus a curved trace."""
+    h, w = 200, 1000
+    img = np.zeros((h, w), dtype=np.uint8)
+    img[::10, :] = 255  # horizontal grid lines (full width)
+    img[:, ::10] = 255  # vertical grid lines (full height)
+    xs = np.arange(w)
+    ys = (h // 2 + 40 * np.sin(2 * np.pi * xs / 150)).astype(int)
+    img[ys, xs] = 255  # the ECG-like trace
+    return img, xs, ys
+
+
+class TestRemoveDarkGrid:
+    """_remove_dark_grid: strip long straight grid lines, keep the curved trace."""
+
+    def test_grid_removed_trace_kept(self):
+        from ecgtizer.PDF2XML import _remove_dark_grid
+        img, xs, ys = _make_grid_and_trace()
+        lit_before = np.mean(img == 255)
+        out = _remove_dark_grid(img)
+        lit_after = np.mean(out == 255)
+        # The grid dominates the lit pixels, so removing it is a big drop.
+        assert lit_after < lit_before * 0.5
+        # Most trace pixels survive (only grid-crossing points are lost).
+        assert np.mean(out[ys, xs] == 255) > 0.6
+
+    def test_binarize_autoengages_on_dense_binary(self):
+        """A dense (dark-grid-like) image is thinned; a sparse one is left alone."""
+        from ecgtizer.PDF2XML import _binarize_image
+        # Dark grayscale grid on white -> NOISE=True path keeps it, gate fires.
+        grid = np.full((200, 1000), 255, dtype=np.uint8)
+        grid[::6, :] = 0
+        grid[:, ::6] = 0  # near-black dense grid
+        dense = _binarize_image(grid, "classic", True)
+        assert np.mean(dense == 255) < 0.15  # grid stripped below the gate
+
+        # Sparse trace-only image stays sparse (gate does not fire).
+        sparse = np.full((200, 1000), 255, dtype=np.uint8)
+        sparse[100, :] = 0  # one thin line
+        out = _binarize_image(sparse, "classic", True)
+        assert np.mean(out == 255) < 0.05
+
+
 class TestCheckNoiseType:
 
     def test_returns_type_and_noise(self, sample_color_image):

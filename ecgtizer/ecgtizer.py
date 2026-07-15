@@ -16,6 +16,7 @@ from .PDF2XML import (
     tracks_extraction,
     lead_extraction,
     lead_cutting,
+    _crop_to_content,
 )
 from .PDF2XML_mod import plot_function, write_xml, plot_overlay
 from .completion import completion_
@@ -56,6 +57,16 @@ class ECGtizer:
         Defaults to ``False``.
     DEBUG : bool, optional
         Show intermediate debug plots. Defaults to ``False``.
+    lead_order : str, list or None, optional
+        Row order (top to bottom) for the 12x1 layout, whose row order varies
+        by device. A preset key (``"standard"`` or ``"interleaved"``), an
+        explicit list of 12 lead names, or ``None`` for the standard order.
+        Only affects 12x1 recordings. Defaults to ``None``.
+    noise : bool, float or None, optional
+        Override the auto-detected noise flag. ``None`` (default) auto-detects;
+        ``False`` forces clean thresholding, which the noise heuristic can
+        wrongly skip on clean but colourful sheets (e.g. 12x1). ``True`` forces
+        the noisy path.
 
     Attributes
     ----------
@@ -76,6 +87,8 @@ class ECGtizer:
         typ: str = "",
         verbose: bool = False,
         DEBUG: bool = False,
+        lead_order: str | list | None = None,
+        noise: bool | float | None = None,
     ) -> None:
         ### Variables ###
         self.file = file
@@ -83,6 +96,8 @@ class ECGtizer:
         self.dpi = dpi
         self.good = True
         self.extraction_method = extraction_method
+        self.lead_order = lead_order
+        self.noise = noise
 
         ### "Constant" ###
         self.page = 1
@@ -172,9 +187,18 @@ class ECGtizer:
                 Callback("--- Check Quality and Type of image : ", end="")
                 start = time.time()
             self.image = np.array(image)
+            # Trim blank paper margins so a landscape recording on a portrait
+            # A4 page is not mis-detected by aspect ratio (needed for 12x1).
+            self.image = _crop_to_content(self.image)
             TYPE, NOISE = check_noise_type(self.image, dpi, DEBUG)
             if self.typ != "":
                 TYPE = self.typ
+            # Override the auto-detected noise flag when the caller forces it.
+            # The variance heuristic in check_noise_type can misread clean but
+            # colourful ECGs (e.g. 12x1 sheets) as noisy, which selects a
+            # cruder binarization; noise=False restores clean thresholding.
+            if self.noise is not None:
+                NOISE = self.noise
             # Kardia Format is particular
             if TYPE.lower() == "kardia":
                 if page_number > 1:
@@ -259,7 +283,15 @@ class ECGtizer:
                 Callback("--- Lead detection : ", end="")
                 start = time.time()
             dic_lead = lead_cutting(
-                dic_tracks_ex, dpi, TYPE, FORMAT, page, NOISE=NOISE, DEBUG=DEBUG, dic_image_bin=image_bin
+                dic_tracks_ex,
+                dpi,
+                TYPE,
+                FORMAT,
+                page,
+                NOISE=NOISE,
+                DEBUG=DEBUG,
+                dic_image_bin=image_bin,
+                lead_order=self.lead_order,
             )
             if verbose:
                 logger.info("Lead detection: OK (%.2fs)", time.time() - start)

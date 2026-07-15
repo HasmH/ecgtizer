@@ -34,17 +34,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--type", "-t", dest="typ", default="", help="Force ECG format (classic, kardia, wellue, apple)."
     )
+    parser.add_argument(
+        "--lead-order",
+        dest="lead_order",
+        default=None,
+        help="12x1 row order (top to bottom): 'standard' or 'interleaved'.",
+    )
+    parser.add_argument(
+        "--noise",
+        dest="noise",
+        choices=["clean", "noisy"],
+        default=None,
+        help="Override noise auto-detection: 'clean' (force clean thresholding) or 'noisy'.",
+    )
     args = parser.parse_args(argv)
 
     if args.verbose:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    noise = {"clean": False, "noisy": True}.get(args.noise, None)
     ecg = ECGtizer(
         args.input,
         dpi=args.dpi,
         extraction_method=args.method,
         typ=args.typ,
         verbose=args.verbose,
+        lead_order=args.lead_order,
+        noise=noise,
     )
 
     if not ecg.good:
