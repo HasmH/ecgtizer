@@ -9,6 +9,7 @@ from .ecgtizer import ECGtizer
 from .analyses import analyse, BlandAltman, scatter_plot, overlap_plot
 from .XML2PDF import xml_to_pdf
 from .anonymisation import anonymisation
+from .vector_extraction import VectorECG, VectorLeadPath, extract_vector_ecg, extract_vector_svg
 
 __all__ = [
     "ECGtizer",
@@ -18,4 +19,8 @@ __all__ = [
     "overlap_plot",
     "xml_to_pdf",
     "anonymisation",
+    "VectorECG",
+    "VectorLeadPath",
+    "extract_vector_ecg",
+    "extract_vector_svg",
 ]

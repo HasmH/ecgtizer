@@ -46,3 +46,6 @@ output/
 htmlcov/
 .pytest_cache/
 
+data/data/*
+data/digitised/*
+data/digitised-full/*

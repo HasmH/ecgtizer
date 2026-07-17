@@ -3,11 +3,13 @@
 Tests all three signal extraction algorithms:
 - lazy_extraction: follows closest lit pixel
 - full_extraction: averages lit pixel positions per column
-- fragmented_extraction: handles text/noise by grouping lit pixels
+- fragmented_extraction: continuity-aware tracing through competing fragments
 """
 import numpy as np
+import cv2
 import pytest
 from ecgtizer.extraction_functions import lazy_extraction, full_extraction, fragmented_extraction
+from ecgtizer.PDF2XML import ECGTrack
 
 
 class TestLazyExtraction:
@@ -159,6 +161,30 @@ class TestFragmentedExtraction:
         result = fragmented_extraction(img)
         for val in result:
             assert abs(val - 50) < 2
+
+    def test_preserves_identity_while_crossing_neighbouring_lane(self):
+        """A tall QRS may cross a neighbouring baseline without switching."""
+        height, width = 401, 600
+        expected = np.full(width, 200.0)
+        expected[180:205] = np.linspace(200, 335, 25)
+        expected[205:230] = np.linspace(335, 200, 25)
+
+        image = np.zeros((height, width), dtype=np.uint8)
+        target_points = np.column_stack((np.arange(width), np.rint(expected))).astype(np.int32)
+        cv2.polylines(image, [target_points], False, 255, 1)
+        cv2.line(image, (0, 300), (width - 1, 300), 255, 1)
+        track = ECGTrack(
+            image,
+            baseline_row=200,
+            spacing=100,
+            neighbour_baselines=np.asarray([100.0, 300.0]),
+        )
+
+        result = np.asarray(fragmented_extraction(track))
+
+        assert np.mean(np.abs(result - expected)) < 1.0
+        assert result.max() > 330
+        assert np.corrcoef(result, expected)[0, 1] > 0.99
 
 
 class TestExtractionConsistency:

@@ -12,13 +12,16 @@ from __future__ import annotations
 from .PDF2XML import (
     convert_PDF2image,
     check_noise_type,
+    classic_layout,
     text_extraction,
     tracks_extraction,
     lead_extraction,
     lead_cutting,
+    overlay_coordinates,
 )
-from .PDF2XML_mod import plot_function, write_xml, plot_overlay
+from .PDF2XML_mod import plot_function, write_xml
 from .completion import completion_
+from .vector_extraction import VectorECG, extract_vector_ecg
 import cv2
 import logging
 from typing import Callable
@@ -46,8 +49,9 @@ class ECGtizer:
         Progress callback function. Called with status strings during
         each pipeline step. Defaults to ``None``.
     extraction_method : str, optional
-        Waveform extraction algorithm: ``"lazy"``, ``"full"`` or
-        ``"fragmented"``. Defaults to ``"full"``.
+        Waveform extraction algorithm: ``"trace"`` (recommended), ``"lazy"``,
+        ``"full"`` or ``"fragmented"``. ``trace`` and ``fragmented`` use the
+        continuity-aware overlapping-lane optimiser. Defaults to ``"trace"``.
     typ : str, optional
         Force a specific ECG format (e.g. ``"classic"``, ``"kardia"``).
         When empty, the format is auto-detected. Defaults to ``""``.
@@ -56,6 +60,9 @@ class ECGtizer:
         Defaults to ``False``.
     DEBUG : bool, optional
         Show intermediate debug plots. Defaults to ``False``.
+    prefer_vector : bool, optional
+        Use lossless vector traces when the PDF contains a fully validated ECG
+        path model, with automatic raster fallback. Defaults to ``True``.
 
     Attributes
     ----------
@@ -63,6 +70,9 @@ class ECGtizer:
         Digitized leads keyed by name (e.g. ``"I"``, ``"II"``, ``"V1"``).
     TYPE : str
         Detected or forced ECG format.
+    LAYOUT : str or None
+        For classic pages, the detected lead arrangement: ``"3x4"``,
+        ``"6x2"`` or ``"12x1"``. ``None`` for non-classic formats.
     good : bool
         ``False`` when the PDF could not be converted.
     """
@@ -72,10 +82,11 @@ class ECGtizer:
         file: str,
         dpi: int,
         Callback: Callable | None = None,
-        extraction_method: str = "full",
+        extraction_method: str = "trace",
         typ: str = "",
         verbose: bool = False,
         DEBUG: bool = False,
+        prefer_vector: bool = True,
     ) -> None:
         ### Variables ###
         self.file = file
@@ -83,10 +94,18 @@ class ECGtizer:
         self.dpi = dpi
         self.good = True
         self.extraction_method = extraction_method
+        if extraction_method not in {"trace", "continuous", "fragmented", "lazy", "full"}:
+            raise ValueError(
+                "Unknown extraction method %r; expected trace, lazy, full, or fragmented."
+                % extraction_method
+            )
 
         ### "Constant" ###
         self.page = 1
         self.extracted_lead = np.zeros((1,))
+        self.LAYOUT = None
+        self.vector_extraction = False
+        self.vector_result: VectorECG | None = None
 
         self.table_parameters = {
             "hour": "unknow",
@@ -129,6 +148,29 @@ class ECGtizer:
         ### Convert PDF files to image ###
         ext = file.lower().rsplit(".", 1)[-1] if "." in file else ""
         if ext == "pdf":
+            # A vector-first path is both faster and lossless: separate PDF
+            # strokes never become an ambiguous merged raster at lead
+            # crossings.  Recognition is deliberately strict; scans and
+            # unfamiliar vector encodings simply continue through the image
+            # pipeline below.
+            if prefer_vector and (not typ or typ.lower() == "classic"):
+                vector_start = time.time()
+                vector_result = extract_vector_ecg(file)
+                if vector_result is not None:
+                    self.vector_extraction = True
+                    self.vector_result = vector_result
+                    self.extracted_lead = {
+                        name: signal.copy() for name, signal in vector_result.leads.items()
+                    }
+                    self.TYPE = "classic"
+                    self.LAYOUT = vector_result.layout
+                    if verbose:
+                        logger.info(
+                            "Lossless vector extraction: OK (%.2fs, %s)",
+                            time.time() - vector_start,
+                            self.LAYOUT,
+                        )
+                    return
             if verbose:
                 logger.info("Conversion PDF in image...")
                 start = time.time()
@@ -214,11 +256,18 @@ class ECGtizer:
                 Callback("--- Detect tracks position : ", end="")
                 start = time.time()
             dic_tracks, varianceh, variancev = tracks_extraction(
-                self.image, TYPE, dpi, FORMAT, DEBUG=DEBUG, NOISE=NOISE
+                image, TYPE, dpi, FORMAT, DEBUG=DEBUG, NOISE=NOISE
             )
             self.varianceh = varianceh
             self.variancev = variancev
             self.dic_tracks = dic_tracks
+            # 6x2 and 12x1 both produce 12 leads, so the arrangement has to be
+            # resolved here from the track count and carried downstream rather
+            # than guessed from the lead count later.
+            if TYPE.lower() == "classic":
+                self.LAYOUT = classic_layout(len(dic_tracks))
+                if verbose:
+                    logger.info("LAYOUT: %s", self.LAYOUT)
             if verbose:
                 logger.info("Detect tracks position: OK (%.2fs)", time.time() - start)
             if Callback is not None:
@@ -330,11 +379,25 @@ class ECGtizer:
         """
         if not completion:
             plot_function(
-                lead_all=self.extracted_lead, lead=lead, b=begin, e=end, c=c, save=save, transparent=transparent
+                lead_all=self.extracted_lead,
+                lead=lead,
+                b=begin,
+                e=end,
+                c=c,
+                save=save,
+                transparent=transparent,
+                layout=self.LAYOUT,
             )
         else:
             plot_function(
-                lead_all=self.extracted_lead_comp, lead=lead, b=begin, e=end, c=c, save=save, transparent=transparent
+                lead_all=self.extracted_lead_comp,
+                lead=lead,
+                b=begin,
+                e=end,
+                c=c,
+                save=save,
+                transparent=transparent,
+                layout=self.LAYOUT,
             )
 
     def plot_over(self) -> None:
@@ -343,7 +406,35 @@ class ECGtizer:
         Displays the source image in grayscale with the digitized
         waveform traces drawn in red for visual verification.
         """
-        plot_overlay(lead=self.dic_tracks_ex_not_scale, image=self.image, piqueh=self.varianceh, piquev=self.variancev)
+        from matplotlib import pyplot as plt
+        if self.vector_result is not None:
+            pages, _, success = convert_PDF2image(self.file, DPI=self.dpi)
+            if not success:
+                raise RuntimeError(f"Could not rasterize {self.file!r} for overlay")
+            image = np.asarray(pages[0])
+        else:
+            image = self.image
+
+        fig, axis = plt.subplots(figsize=(16, 12))
+        axis.imshow(image, cmap="gray")
+        if self.vector_result is not None:
+            for source_path in self.vector_result.paths.values():
+                axis.plot(
+                    source_path.x * self.dpi / 72.0,
+                    source_path.y * self.dpi / 72.0,
+                    color="red",
+                    linewidth=0.7,
+                    alpha=0.85,
+                )
+            axis.set_title("Lossless vector waveform overlay")
+        else:
+            for track_index, signal in self.dic_tracks_ex_not_scale.items():
+                x, y = overlay_coordinates(self.dic_tracks[track_index], signal)
+                axis.plot(x, y, color="red", linewidth=0.7, alpha=0.85)
+            axis.set_title("Raster waveform overlay")
+        axis.axis("off")
+        plt.tight_layout()
+        plt.show()
 
     def save_xml(self, save: str, num_version: str = "0.0", date_version: str = "17.O4.2023") -> None:
         """Export the extracted leads as an HL7 aECG XML file.
@@ -373,6 +464,9 @@ class ECGtizer:
         cover only 2.5 s or 5 s to the full 10 s duration. The
         completed leads are stored in ``self.extracted_lead_comp``.
 
+        A 12x1 recording is already 10 s per lead and is copied over
+        unchanged.
+
         Parameters
         ----------
         path_model : str
@@ -380,4 +474,6 @@ class ECGtizer:
         device : str
             PyTorch device string (e.g. ``"cpu"`` or ``"cuda"``).
         """
-        self.extracted_lead_comp = completion_(ecg=self.extracted_lead, path_model=path_model, device=device)
+        self.extracted_lead_comp = completion_(
+            ecg=self.extracted_lead, path_model=path_model, device=device, layout=self.LAYOUT
+        )

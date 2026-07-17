@@ -15,6 +15,8 @@ from os.path import exists
 from os import makedirs
 import numpy as np
 
+from .PDF2XML import LEAD_ORDER_DEFAULT
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,11 +28,12 @@ def plot_function(
     c: str | None = None,
     save: str | bool = False,
     transparent: bool = False,
+    layout: str | None = None,
 ) -> None:
     """Plot extracted ECG leads.
 
-    Displays a single lead or a multi-panel grid depending on the number
-    of leads available. Automatically selects 3x4, 6x2 or 6x1 layout.
+    Displays a single lead or a multi-panel grid depending on the layout.
+    Supports the 3x4, 6x2, 12x1 and Kardia 6x1 arrangements.
 
     Parameters
     ----------
@@ -49,12 +52,23 @@ def plot_function(
         File path to save the figure, or ``False`` to skip saving.
     transparent : bool, optional
         Save the figure with a transparent background.
+    layout : str or None, optional
+        Source layout (``"3x4"``, ``"6x2"`` or ``"12x1"``). 6x2 and 12x1
+        both yield 12 leads, so the grid cannot be inferred from the lead
+        count alone. When ``None``, the layout is guessed from that count.
     """
+    figsize = (20, 14)
     # If it is a multilead or not
     if len(lead_all) > 1:
+        # 12x1: one full 10sec lead per row.  Must be checked before the
+        # lead-count heuristic below, which would read these 12 leads as 6x2.
+        if layout == "12x1":
+            FORMAT = [12, 1]
+            dic_pos = {name: [i] for i, name in enumerate(LEAD_ORDER_DEFAULT)}
+            figsize = (20, 28)
         # If it is Kardia, 3x4 or 6x2 format
         # if it is 3x4
-        if len(lead_all) == 13:
+        elif len(lead_all) == 13:
             FORMAT = [3, 4]
             dic_pos = {
                 "I": [0, 0],
@@ -104,7 +118,7 @@ def plot_function(
             plt.xlabel("Time (1/500)sec")
             plt.ylabel("Amplitude µV")
         else:
-            fig = plt.figure(figsize=(20, 14))
+            fig = plt.figure(figsize=figsize)
             axs = fig.subplots(FORMAT[0], FORMAT[1])
             for i in lead_all:
                 if i != "ref" and i != "IIc":

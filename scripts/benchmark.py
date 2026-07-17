@@ -8,7 +8,7 @@ as a PNG bar chart.
 Usage
 -----
     python -m scripts.benchmark
-    python -m scripts.benchmark --dpi 200 300 500 --methods lazy full fragmented
+    python -m scripts.benchmark --dpi 200 300 500 --methods lazy full trace
     python -m scripts.benchmark --save output/benchmark.png
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from ecgtizer.PDF2XML import (
     lead_cutting,
 )
 
-SAMPLE_PDF = "data/PTB-XL/PDF/00009_hr.pdf"
+SAMPLE_PDF = "data/data/BALOGH_Mihaly_450342_12by1_2024-06-05_2024-06-05.pdf"
 
 
 def _time(func, *args, **kwargs):
@@ -63,7 +63,7 @@ def benchmark_pipeline(pdf_path: str, dpi: int, method: str) -> dict[str, float]
 
     # Stage 4: track segmentation
     (dic_tracks_img, _, _), timings["track_segment"] = _time(
-        tracks_extraction, image, TYPE, dpi, "", NOISE=NOISE, DEBUG=False
+        tracks_extraction, image_clean, TYPE, dpi, "", NOISE=NOISE, DEBUG=False
     )
 
     # Stage 5: waveform extraction
@@ -73,7 +73,7 @@ def benchmark_pipeline(pdf_path: str, dpi: int, method: str) -> dict[str, float]
 
     # Stage 6: lead cutting / calibration
     _, timings["lead_cut"] = _time(
-        lead_cutting, dic_extracted, dpi, TYPE, "", 0, NOISE, False
+        lead_cutting, dic_extracted, dpi, TYPE, "", 0, NOISE, False, dic_bin
     )
 
     timings["total"] = sum(timings.values())
@@ -161,7 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark ECGtizer pipeline")
     parser.add_argument("--pdf", default=SAMPLE_PDF, help="PDF file to benchmark")
     parser.add_argument("--dpi", nargs="+", type=int, default=[200, 300, 500], help="DPI values to test")
-    parser.add_argument("--methods", nargs="+", default=["lazy", "full", "fragmented"], help="Extraction methods")
+    parser.add_argument("--methods", nargs="+", default=["lazy", "full", "trace"], help="Extraction methods")
     parser.add_argument("--repeats", type=int, default=1, help="Repeats per configuration")
     parser.add_argument("--save", default=None, help="Save bar chart to this path (e.g. output/benchmark.png)")
     args = parser.parse_args()

@@ -23,6 +23,9 @@ from reportlab.graphics import renderPDF
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+# --- Signal parameters ---
+SIGNAL_LENGTH = 5000  # 10 seconds at 500 Hz
+
 
 def read_lead(lead_str: str) -> list[int | float]:
     """Parse a space-separated string of signal values into a list.
@@ -421,6 +424,8 @@ class ecg_plot:
         for c in range(0, self.cols):
 
             if type_of_pdf == "type1":
+                # The last row of a 3x4 page is the lead II rhythm strip,
+                # drawn separately after this loop.
                 range_max = self.rows - 1
             else:
                 range_max = self.rows
@@ -447,8 +452,18 @@ class ecg_plot:
 
                 y_offset = self.graph_y + self.graph_h - sector_h * (r + 0.5) - offset
 
+                # Case of type3 PDF #
+                if type_of_pdf == "type3":
+                    # Single column: every row carries its own reference pulse
+                    # followed by the whole 10sec lead, so there are no
+                    # per-column offsets to accumulate.
+                    p = self.lead_plot_points(impulse_pulse, 10, y_offset, sector_w, freq)
+                    if len(p) > 1:
+                        self.draw.add(self.draw_polyline(p, self.sty_line_plot))
+                    x_offset = 17.2
+
                 # Case of type2 PDF#
-                if type_of_pdf == "type2":
+                elif type_of_pdf == "type2":
                     if i < 6:
                         p = self.lead_plot_points(impulse_pulse, 10, y_offset, sector_w, freq)
                         if len(p) > 1:
@@ -510,9 +525,15 @@ def Write_PDF(ecg: dict[str, np.ndarray], path_output: str, type_of_pdf: str, le
     path_output : str
         Output PDF file path (relative to cwd).
     type_of_pdf : str
-        Layout type: ``"type1"`` for 3x4, ``"type2"`` for 6x2.
+        Layout type: ``"type1"`` for 3x4, ``"type2"`` for 6x2,
+        ``"type3"`` for 12x1.
     lead_IIc : str or numpy.ndarray, optional
         Full lead-II continuous signal for the rhythm strip (type1 only).
+
+    Raises
+    ------
+    ValueError
+        If ``type_of_pdf`` is not one of the supported layouts.
     """
     initial_dir = os.getcwd()
     if not os.path.isabs(path_output):
@@ -549,6 +570,22 @@ def Write_PDF(ecg: dict[str, np.ndarray], path_output: str, type_of_pdf: str, le
 
         # for i in range(3):
         #       new_ecg[i] = impulse_pulse
+
+    elif type_of_pdf == "type3":
+        leads_to_plot = list(range(0, 12))
+        cols = 1
+        rows = 12
+        # 12 lanes leave only graph_h/12 ~= 13.3mm each, where the 10mm/mV used
+        # by the other layouts would make neighbouring leads collide.  Halving
+        # the gain is safe: the reference pulse is drawn at the same scale, and
+        # extraction recovers amplitude from that pulse rather than assuming a
+        # fixed gain.
+        ampli = 5
+
+    else:
+        raise ValueError(
+            "Unknown type_of_pdf %r, expected 'type1' (3x4), 'type2' (6x2) or 'type3' (12x1)." % (type_of_pdf,)
+        )
 
     # Prepare the Reportlab Drawing object.
     plot = ecg_plot(unit=output_units, cols=cols, rows=rows, ampli=ampli, speed=speed)
@@ -612,6 +649,16 @@ def Write_PDF(ecg: dict[str, np.ndarray], path_output: str, type_of_pdf: str, le
             elif k == "V6":
                 new_ecg[11] = ecg[k][2500:]
 
+    elif type_of_pdf == "type3":
+        # One lead per row, each spanning the whole record: no slicing.
+        # Ordering off LEAD_LABEL keeps the data aligned with the row labels
+        # drawn from it, and tolerates both "aVR" and "AVR" spellings while
+        # skipping non-lead keys such as "ref" and "IIc".
+        order = [name.upper() for name in ecg_plot.LEAD_LABEL]
+        for k in ecg.keys():
+            if k.upper() in order:
+                new_ecg[order.index(k.upper())] = ecg[k][:SIGNAL_LENGTH]
+
     plot.add_lead_plots(impulse_pulse, new_ecg, freq, type_of_pdf, lead_IIc)
 
     pdf_title = "ECG %s %dx%d t0=%.1fsec" % ("ECG", rows, cols, 0.0)
@@ -630,7 +677,8 @@ def xml_to_pdf(path_input: str, path_output: str, type_of_pdf: str = "type1") ->
     path_output : str
         Path for the output PDF file.
     type_of_pdf : str, optional
-        Layout: ``"type1"`` (3x4) or ``"type2"`` (6x2). Defaults to ``"type1"``.
+        Layout: ``"type1"`` (3x4), ``"type2"`` (6x2) or ``"type3"`` (12x1).
+        Defaults to ``"type1"``.
     """
     ecg = read_xml(path_input)
     # For type1 (3x4), the rhythm strip needs the full lead II signal

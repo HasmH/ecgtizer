@@ -180,3 +180,21 @@ class TestCheckNoiseType:
         img[300, :] = [255, 255, 255]
         typ, noise = check_noise_type(img, 300, False)
         assert typ.lower() == 'kardia'
+
+
+class TestRuleRemoval:
+
+    def test_removes_page_spanning_rule_but_preserves_waveform(self):
+        from ecgtizer.PDF2XML import _remove_long_rules
+
+        height, width = 300, 1000
+        image = np.zeros((height, width), dtype=np.uint8)
+        image[260, :] = 255
+        x = np.arange(width)
+        y = np.rint(150 + 25 * np.sin(2 * np.pi * x / 120)).astype(int)
+        image[y, x] = 255
+
+        cleaned = _remove_long_rules(image)
+
+        assert np.count_nonzero(cleaned[260]) == 0
+        assert np.mean(cleaned[y, x] > 0) > 0.98

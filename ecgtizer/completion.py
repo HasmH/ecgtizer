@@ -7,11 +7,15 @@ normalization helpers, model loading, and the main completion entry point.
 
 from __future__ import annotations
 
+import logging
+
 import torch.nn as nn
 import torch
 import numpy as np
 from scipy import signal
 from scipy.interpolate import interp1d
+
+logger = logging.getLogger(__name__)
 
 # --- Signal parameters ---
 NUM_LEADS = 12
@@ -396,7 +400,9 @@ def load_model(path: str, device: str) -> Autoencoder_net:
     return model
 
 
-def completion_(ecg: dict[str, np.ndarray], path_model: str, device: str) -> dict[str, np.ndarray]:
+def completion_(
+    ecg: dict[str, np.ndarray], path_model: str, device: str, layout: str | None = None
+) -> dict[str, np.ndarray]:
     """Complete partial ECG leads to full 10-second recordings.
 
     Normalizes and resamples the input leads, runs them through the
@@ -410,12 +416,23 @@ def completion_(ecg: dict[str, np.ndarray], path_model: str, device: str) -> dic
         Path to the ``.pth`` model weights.
     device : str
         PyTorch device string.
+    layout : str or None, optional
+        Source layout (``"3x4"``, ``"6x2"`` or ``"12x1"``). A ``"12x1"``
+        recording is already complete and is returned untouched.
 
     Returns
     -------
     dict[str, numpy.ndarray]
         Completed leads with 5000 samples each.
     """
+    if layout == "12x1":
+        # Every lead of a 12x1 page already spans the full 10 seconds, so there
+        # is nothing to reconstruct.  Completing anyway would be destructive:
+        # replace_random() would mask off half of each real lead and let the
+        # model invent a replacement for measured signal.
+        logger.info("Layout is 12x1: leads are already 10s, skipping completion.")
+        return {k: np.array(v) for k, v in ecg.items()}
+
     model = load_model(path_model, device)
     if "IIc" in ecg.keys():
         dic_sorted = ["I", "IIc", "III", "AVL", "AVR", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]

@@ -14,7 +14,8 @@ format. A deep-learning completion module can extend partial leads (2.5 s or
 
 - PDF and image input (PDF, PNG, JPG, JPEG)
 - Automatic ECG format detection (Classic, Wellue, Kardia, Apple Watch)
-- Three extraction algorithms with different speed/accuracy trade-offs
+- Lossless vector-PDF extraction with strict validation and automatic raster fallback
+- Continuity-aware raster tracing through overlapping lead corridors
 - Noise detection and adaptive binarization (Otsu / Sauvola thresholding)
 - Deep-learning lead completion (PyTorch autoencoder)
 - HL7 aECG XML export
@@ -33,6 +34,11 @@ format. A deep-learning completion module can extend partial leads (2.5 s or
   PDF / Image
        |
        v
++-------------------+    validated vector paths    +------------------+
+| vector recognition| ---------------------------> | calibrated leads |
++-------------------+                              +------------------+
+       | raster/image fallback
+       v
  +------------------+
  |  convert_PDF2image|   pdf2image + poppler
  +------------------+
@@ -44,19 +50,19 @@ format. A deep-learning completion module can extend partial leads (2.5 s or
        |
        v
  +------------------+
- |  text_extraction  |   Mask header text and annotations
+ |  text_extraction  |   Format-aware, non-destructive preprocessing
  +------------------+
        |
        v
  +------------------+
- | tracks_extraction |   Horizontal/vertical variance peaks
- +------------------+   Splits image into individual ECG strips
+ | tracks_extraction |   Calibration-edge baseline model (4/6/12 rows)
+ +------------------+   Overlapping corridors + scale-relative rule removal
        |
        v
  +------------------+
  |  lead_extraction  |   Binarize + extract waveform per strip
  +------------------+   Uses selected extraction method
-       |                 (lazy / full / fragmented)
+       |                 (trace recommended; lazy/full available)
        v
  +------------------+
  |   lead_cutting    |   Calibrate amplitude using ref pulse
@@ -81,6 +87,7 @@ format. A deep-learning completion module can extend partial leads (2.5 s or
 |--------|--------|-------|--------|
 | Classic 3x4 | 4 rows, 3 columns | I, II, III, aVR, aVL, aVF, V1-V6 | Standard 12-lead printout |
 | Classic 6x2 | 2 rows, 6 columns | Same 12 leads | Alternative 12-lead layout |
+| Classic 12x1 | 12 rows, 1 column | Same 12 leads, full 10 s each | One lead per full-width strip |
 | Wellue | Single strip | I (or selected lead) | Wellue portable devices |
 | Kardia single | Single strip | I | AliveCor Kardia single-lead |
 | Kardia multi | Multiple pages | I, II, III, aVR, aVL, aVF | AliveCor Kardia 6-lead |
@@ -131,8 +138,9 @@ from ecgtizer import ECGtizer
 
 ecg = ECGtizer(
     file="path/to/ecg.pdf",
-    dpi=500,
-    extraction_method="fragmented",  # "lazy", "full", or "fragmented"
+    dpi=300,
+    extraction_method="trace",  # raster fallback method
+    prefer_vector=True,          # validated vector source, else raster fallback
     verbose=True,
 )
 
@@ -196,6 +204,9 @@ scatter_plot(results)
 from ecgtizer import xml_to_pdf
 
 xml_to_pdf("digitized.xml", "reconstructed.pdf")
+
+# Choose the page layout: "type1" (3x4, default), "type2" (6x2), "type3" (12x1)
+xml_to_pdf("digitized.xml", "reconstructed_12x1.pdf", type_of_pdf="type3")
 ```
 
 ### Command-line usage
@@ -212,8 +223,8 @@ python ECGtizer_main.py "data/PTB-XL/PDF/00121_hr.pdf" 500 "fragmented" \
 | Method | Speed | Accuracy | Noise Tolerance | Description |
 |--------|-------|----------|-----------------|-------------|
 | `lazy` | Fast | Moderate | High | Follows the nearest lit pixel from an anchor point. Smooths signals but handles annotations well. |
-| `full` | Fast | High | Moderate | Averages all lit pixel positions per column. Captures more detail but may include annotation artifacts. |
-| `fragmented` | Slower | Highest | Moderate | Combines contour detection with column-wise extraction. Best fidelity for clean recordings. |
+| `full` | Fast | Low with overlap | Low | Averages all lit fragments per column; useful only for isolated clean lanes. |
+| `trace` (`fragmented`) | CPU, global | Highest raster fidelity | High | Second-order continuity, baseline identity and missing-ink interpolation inside overlapping corridors. |
 
 ---
 
